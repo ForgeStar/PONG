@@ -68,7 +68,7 @@
   </div>
   <img id="panel" src="bezel.png" alt="">
 </div>
-<div id="hint">Up/Down or W/S to move &middot; P pause &middot; M mute &middot; C CRT: <span id="crtlabel">Glass</span></div>
+<div id="hint">Up/Down or W/S to move &middot; tap to start &middot; drag to steer &middot; P pause &middot; M mute &middot; C CRT: <span id="crtlabel">Glass</span></div>
 <script>
 "use strict";
 // ============================================================
@@ -556,8 +556,9 @@ window.addEventListener("keydown", (e) => {
   if (e.code === "KeyM") muted = !muted;
   if (e.code === "KeyC") setCRT((crtMode + 1) % 3);
 
-  // Start / restart
-  if (state === "attract") {
+  // Start / restart (skipped on the frame after a touch drag ended)
+  if (touchMoved) touchMoved = false;
+  else if (state === "attract") {
     state = "ready";
     stateTimer = 1.0;
     scoreLeft = 0; scoreRight = 0;
@@ -574,29 +575,50 @@ window.addEventListener("keyup", (e) => {
   if (e.code === "ArrowDown" || e.code === "KeyS") keyDown = false;
 });
 
-// Touch support (tap to start, drag to move)
-let touchActive = false;
-cv.addEventListener("touchstart", (e) => {
-  e.preventDefault();
-  audio();
-  touchActive = true;
-  if (state === "attract" || state === "gameover") {
-    state = "ready"; stateTimer = 1.0;
-    scoreLeft = 0; scoreRight = 0;
-    resetBall();
-  }
-  updateTouchY(e.touches[0].clientY);
-});
-cv.addEventListener("touchmove", (e) => {
-  e.preventDefault();
-  if (touchActive) updateTouchY(e.touches[0].clientY);
-});
-cv.addEventListener("touchend", () => { touchActive = false; });
-function updateTouchY(clientY) {
-  const rect = cv.getBoundingClientRect();
-  const y = (clientY - rect.top) / rect.height * H;
-  playerY = Math.max(0, Math.min(H - PADDLE_H, y - PADDLE_H / 2));
+// ---------------- Pointer / touch input ----------------
+// Same approach as Puck Man: window-level listeners (the CRT overlay canvas
+// sits above the game canvas, so element-level listeners on cv never fire).
+// Tap = start/restart (also works in the X player-card iframe), drag up/down
+// = paddle follows the finger.
+let touchOrigin = null;
+let touchMoved = false;
+const SWIPE_MIN = 12; // px of travel before a touch counts as steering
+function beginGesture(e) {
+  audio(); // user gesture => unlock Web Audio
+  const t = e.touches && e.touches[0];
+  if (t) { touchOrigin = { x: t.clientX, y: t.clientY }; touchMoved = false; }
 }
+function moveGesture(e) {
+  const t = e.touches && e.touches[0];
+  if (!t || !touchOrigin) return;
+  if (Math.abs(t.clientX - touchOrigin.x) > SWIPE_MIN ||
+      Math.abs(t.clientY - touchOrigin.y) > SWIPE_MIN) touchMoved = true;
+  if (touchMoved && (state === "play" || state === "ready" || state === "point")) {
+    const rect = cv.getBoundingClientRect();
+    const y = (t.clientY - rect.top) / rect.height * H;
+    playerY = Math.max(0, Math.min(H - PADDLE_H, y - PADDLE_H / 2));
+  }
+}
+function endGesture(e) {
+  const c = (e.changedTouches && e.changedTouches[0]) || e;
+  const sx = touchOrigin ? touchOrigin.x : c.clientX;
+  const sy = touchOrigin ? touchOrigin.y : c.clientY;
+  touchOrigin = null;
+  const dx = c.clientX - sx, dy = c.clientY - sy;
+  if (Math.abs(dx) < SWIPE_MIN && Math.abs(dy) < SWIPE_MIN && !touchMoved) {
+    // tap / click: start the game, or restart after game over
+    if (state === "attract" || state === "gameover") {
+      state = "ready"; stateTimer = 1.0;
+      scoreLeft = 0; scoreRight = 0;
+      resetBall();
+    }
+  }
+  touchMoved = false;
+}
+window.addEventListener("touchstart", beginGesture, { passive: true });
+window.addEventListener("touchmove", moveGesture, { passive: true });
+window.addEventListener("touchend", endGesture);
+window.addEventListener("click", endGesture);
 
 // ---------------- Main loop ----------------
 function frame(now) {
