@@ -133,6 +133,21 @@ function audio() {
   if (actx && actx.state === "suspended") actx.resume();
   return actx;
 }
+// iOS (incl. the X player-card iframe) only unlocks Web Audio for audio
+// scheduled INSIDE a user gesture. Our first real beep can fire up to a
+// second after the tap (outside any gesture), so prime the pipeline with
+// an inaudible blip on every gesture instead.
+function primeAudio() {
+  const a = audio();
+  if (!a) return;
+  if (a.state === "suspended") a.resume();
+  try {
+    const o = a.createOscillator(), g = a.createGain();
+    o.connect(g); g.connect(a.destination);
+    g.gain.setValueAtTime(0.0001, a.currentTime);
+    o.start(); o.stop(a.currentTime + 0.06);
+  } catch (e) {}
+}
 // Classic Pong "blip" sounds (short square/sine beeps)
 function beep(freq, dur, type, vol, slideTo) {
   if (muted) return;
@@ -546,7 +561,7 @@ setCRT(2);
 
 // ---------------- Input ----------------
 window.addEventListener("keydown", (e) => {
-  audio();
+  primeAudio();
   if (e.code === "ArrowUp" || e.code === "KeyW") { keyUp = true; e.preventDefault(); }
   if (e.code === "ArrowDown" || e.code === "KeyS") { keyDown = true; e.preventDefault(); }
   if (e.code === "KeyP") {
@@ -584,7 +599,7 @@ let touchOrigin = null;
 let touchMoved = false;
 const SWIPE_MIN = 12; // px of travel before a touch counts as steering
 function beginGesture(e) {
-  audio(); // user gesture => unlock Web Audio
+  primeAudio(); // user gesture => unlock Web Audio (silent prime blip)
   const t = e.touches && e.touches[0];
   if (t) { touchOrigin = { x: t.clientX, y: t.clientY }; touchMoved = false; }
 }
@@ -600,6 +615,7 @@ function moveGesture(e) {
   }
 }
 function endGesture(e) {
+  primeAudio(); // tap/click counts as a gesture too (click-only iframes)
   const c = (e.changedTouches && e.changedTouches[0]) || e;
   const sx = touchOrigin ? touchOrigin.x : c.clientX;
   const sy = touchOrigin ? touchOrigin.y : c.clientY;
@@ -619,6 +635,7 @@ window.addEventListener("touchstart", beginGesture, { passive: true });
 window.addEventListener("touchmove", moveGesture, { passive: true });
 window.addEventListener("touchend", endGesture);
 window.addEventListener("click", endGesture);
+window.addEventListener("pointerdown", primeAudio, { passive: true });
 
 // ---------------- Main loop ----------------
 function frame(now) {
