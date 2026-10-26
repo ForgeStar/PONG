@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PONG — Classic Arcade Clone</title>
+<!-- X.com player card: playable in-post embed -->
+<meta name="twitter:card" content="player">
+<meta name="twitter:site" content="@_RexNebular_">
+<meta name="twitter:title" content="PONG — Classic Arcade Clone">
+<meta name="twitter:description" content="Classic Pong in a 3-stripe arcade cabinet, with CRT glass, barrel distortion and scanlines. Up/Down or W/S. Playable right here in X.">
+<meta name="twitter:image" content="https://forgestar.github.io/PongArcade/preview.png">
+<meta name="twitter:player" content="https://forgestar.github.io/PongArcade/">
+<meta name="twitter:player:width" content="480">
+<meta name="twitter:player:height" content="480">
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: #0a0a0a;
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Courier New", monospace;
+    user-select: none;
+  }
+  /* Cabinet face: the user-made bezel art (yellow panel, 3-tone stripes,
+     black plastic screen bezel) with a TRANSPARENT screen window. */
+  #bezel { position: relative; line-height: 0; }
+  #bezel::before {
+    content: "";
+    display: block;
+    width: 100%;
+    padding-top: 100%; /* bezel.png is 1024x1024 */
+  }
+  /* The screen window = the transparent hole in bezel.png (measured:
+     left 160/1024, top 248/1024, 708x592) */
+  #screen {
+    position: absolute;
+    left: 15.625%; top: 24.21875%;
+    width: 69.140625%; height: 57.8125%;
+    background: #000;
+  }
+  canvas {
+    display: block;
+    background: #000;
+    width: 100%; height: 100%;
+    position: absolute;
+    top: 0; left: 0;
+  }
+  /* CRT shader layer overlays the game canvas; it is smooth, not pixelated */
+  #fx { image-rendering: auto; }
+  /* Bezel art sits on top of the screen; its transparent hole shows the game */
+  #panel {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+  #hint {
+    position: fixed; bottom: 8px; left: 0; right: 0;
+    text-align: center; color: #556; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div id="bezel">
+  <div id="screen">
+    <canvas id="game" width="580" height="485"></canvas>
+    <canvas id="fx" width="580" height="485"></canvas>
+  </div>
+  <img id="panel" src="bezel.png" alt="">
+</div>
+<div id="hint">Up/Down or W/S to move &middot; P pause &middot; M mute &middot; C CRT: <span id="crtlabel">Glass</span></div>
+<script>
+"use strict";
+// ============================================================
+// PONG CLONE — single-file, vanilla JS + canvas
+// Classic single-player Pong vs AI opponent.
+// Cabinet: user-made bezel art (3-tone stripes + PONG logotype).
+// CRT effects (barrel distortion + scanlines) from Puck Man.
+// ============================================================
+
+const W = 580, H = 485;
+const cv = document.getElementById("game");
+cv.width = W; cv.height = H;
+const ctx = cv.getContext("2d");
+
+// Scale the cabinet to fit the viewport (same approach as Puck Man).
+const PANEL_W = 1024, PANEL_H = 1024; // bezel.png
+const bezel = document.getElementById("bezel");
+function fitCanvas() {
+  const scale = Math.min(1, window.innerWidth / PANEL_W, window.innerHeight / PANEL_H);
+  bezel.style.width = Math.floor(PANEL_W * scale) + "px";
+}
+window.addEventListener("resize", fitCanvas);
+fitCanvas();
+
+// ---------------- Constants ----------------
+const PADDLE_W = 8, PADDLE_H = 64;
+const PADDLE_X_LEFT = 26, PADDLE_X_RIGHT = W - 26 - PADDLE_W;
+const BALL_SIZE = 8;
+const WIN_SCORE = 5;
+const PADDLE_SPEED = 320; // px/s
+const BALL_BASE_SPEED = 240; // px/s
+const BALL_SPEED_INCREMENT = 1.08; // multiply by this each paddle hit
+const AI_MAX_SPEED = 225; // px/s (slightly slower than player)
+const AI_ERROR_MARGIN = 8; // pixels of intentional imprecision
+
+// ---------------- Game State ----------------
+let state = "attract"; // attract | ready | play | point | gameover
+let stateTimer = 0;
+let scoreLeft = 0, scoreRight = 0;
+let winner = "";
+let muted = false;
+let lastTime = performance.now();
+
+// Paddles
+let playerY = H / 2 - PADDLE_H / 2;
+let aiY = H / 2 - PADDLE_H / 2;
+
+// Ball
+let ballX = W / 2, ballY = H / 2;
+let ballVX = 0, ballVY = 0;
+let ballSpeed = BALL_BASE_SPEED;
+let ballDirection = 1; // 1 = right, -1 = left
+let serveTimer = 0;
+
+// Input
+let keyUp = false, keyDown = false;
+
+// ---------------- Audio (Web Audio API — same approach as Puck Man) ----------------
+let actx = null;
+function audio() {
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){} }
+  if (actx && actx.state === "suspended") actx.resume();
+  return actx;
+}
+// Classic Pong "blip" sounds (short square/sine beeps)
+function beep(freq, dur, type, vol, slideTo) {
+  if (muted) return;
+  const a = audio(); if (!a) return;
+  const t = a.currentTime;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type || "square";
+  o.frequency.setValueAtTime(freq, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30, slideTo), t + dur);
+  g.gain.setValueAtTime(vol || 0.08, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const sfx = {
+  paddle: () => beep(440, 0.06, "square", 0.08),
+  wall:   () => beep(330, 0.05, "square", 0.06),
+  score:  () => beep(880, 0.2, "sine", 0.07, 220),
+  serve:  () => beep(660, 0.08, "square", 0.06),
+  win:    () => { beep(523, 0.12, "sine", 0.08); setTimeout(()=>beep(659,0.12,"sine",0.08),120); setTimeout(()=>beep(784,0.2,"sine",0.08),240); },
+};
+
+// ---------------- Ball / Paddle Logic ----------------
+function resetBall(direction) {
+  ballX = W / 2; ballY = H / 2;
+  // Reset both paddles to center for every serve (closes the
+  // "freeze from the bottom, then rush across" exploit window)
+  playerY = H / 2 - PADDLE_H / 2;
+  aiY = H / 2 - PADDLE_H / 2;
+  ballSpeed = BALL_BASE_SPEED;
+  ballDirection = direction || (Math.random() < 0.5 ? 1 : -1);
+  // Serve at a random angle (-30 to 30 degrees)
+  const angle = (Math.random() * 60 - 30) * Math.PI / 180;
+  ballVX = ballSpeed * Math.cos(angle) * ballDirection;
+  ballVY = ballSpeed * Math.sin(angle);
+  serveTimer = 0.8; // brief pause before ball moves
+}
+
+function serveBall() {
+  resetBall(ballDirection);
+  state = "play";
+  sfx.serve();
+}
+
+function onPaddleHit(isLeft) {
+  // Calculate hit position relative to paddle center (-1 to 1)
+  const paddleCenter = isLeft ? playerY + PADDLE_H / 2 : aiY + PADDLE_H / 2;
+  const hitPos = (ballY - paddleCenter) / (PADDLE_H / 2);
+  // Deflection angle: max ~60 degrees
+  const maxAngle = 60 * Math.PI / 180;
+  const angle = hitPos * maxAngle;
+
+  ballSpeed *= BALL_SPEED_INCREMENT;
+  // Cap max speed
+  ballSpeed = Math.min(ballSpeed, 700);
+
+  const dir = isLeft ? 1 : -1;
+  ballVX = ballSpeed * Math.cos(angle) * dir;
+  ballVY = ballSpeed * Math.sin(angle);
+
+  // Push ball out of paddle to prevent sticking
+  if (isLeft) ballX = PADDLE_X_LEFT + PADDLE_W + BALL_SIZE;
+  else ballX = PADDLE_X_RIGHT - BALL_SIZE;
+
+  sfx.paddle();
+}
+
+function onScore(leftScored) {
+  if (leftScored) scoreLeft++;
+  else scoreRight++;
+  sfx.score();
+
+  if (scoreLeft >= WIN_SCORE || scoreRight >= WIN_SCORE) {
+    state = "gameover";
+    winner = scoreLeft >= WIN_SCORE ? "YOU" : "CPU";
+    sfx.win();
+  } else {
+    state = "point";
+    stateTimer = 1.5;
+    // Next serve goes toward the player who just lost the point
+    resetBall(leftScored ? -1 : 1);
+  }
+}
+
+// ---------------- AI ----------------
+function updateAI(dt) {
+  // AI predicts where the ball will be when it reaches the AI's x position
+  let targetY = H / 2 - PADDLE_H / 2;
+
+  if (ballVX > 0) { // ball moving toward AI
+    // Predict intersection
+    const timeToReach = (PADDLE_X_RIGHT - ballX) / ballVX;
+    if (timeToReach > 0 && timeToReach < 2) {
+      let predictedY = ballY + ballVY * timeToReach;
+      // Bounce prediction
+      const range = H;
+      while (predictedY < 0 || predictedY > range) {
+        if (predictedY < 0) predictedY = -predictedY;
+        if (predictedY > range) predictedY = 2 * range - predictedY;
+      }
+      targetY = predictedY - PADDLE_H / 2;
+    }
+  } else {
+    // Ball moving away: drift back toward center
+    targetY = H / 2 - PADDLE_H / 2;
+  }
+
+  // Add slight error for imperfection
+  targetY += (Math.sin(performance.now() / 800) * AI_ERROR_MARGIN);
+
+  // Clamp
+  targetY = Math.max(0, Math.min(H - PADDLE_H, targetY));
+
+  // Move toward target with speed limit
+  const diff = targetY - aiY;
+  const maxMove = AI_MAX_SPEED * dt;
+  if (Math.abs(diff) > 2) {
+    aiY += Math.sign(diff) * Math.min(Math.abs(diff), maxMove);
+  }
+  aiY = Math.max(0, Math.min(H - PADDLE_H, aiY));
+}
+
+// ---------------- Update ----------------
+function update(dt) {
+  if (state === "attract") return;
+  if (state === "gameover") return;
+
+  if (state === "ready") {
+    stateTimer -= dt;
+    if (stateTimer <= 0) serveBall();
+    return;
+  }
+  if (state === "point") {
+    stateTimer -= dt;
+    if (stateTimer <= 0) { state = "ready"; stateTimer = 1.0; }
+    return;
+  }
+  if (state !== "play") return;
+
+  // Serve delay
+  if (serveTimer > 0) { serveTimer -= dt; return; }
+
+  // Player input
+  if (keyUp) playerY -= PADDLE_SPEED * dt;
+  if (keyDown) playerY += PADDLE_SPEED * dt;
+  playerY = Math.max(0, Math.min(H - PADDLE_H, playerY));
+
+  // AI
+  updateAI(dt);
+
+  // Ball movement
+  ballX += ballVX * dt;
+  ballY += ballVY * dt;
+
+  // Wall bounce (top/bottom)
+  if (ballY <= 0) { ballY = 0; ballVY = -ballVY; sfx.wall(); }
+  if (ballY >= H - BALL_SIZE) { ballY = H - BALL_SIZE; ballVY = -ballVY; sfx.wall(); }
+
+  // Paddle collision — left (player)
+  if (ballVX < 0 &&
+      ballX <= PADDLE_X_LEFT + PADDLE_W &&
+      ballX + BALL_SIZE >= PADDLE_X_LEFT &&
+      ballY + BALL_SIZE >= playerY &&
+      ballY <= playerY + PADDLE_H) {
+    onPaddleHit(true);
+  }
+
+  // Paddle collision — right (AI)
+  if (ballVX > 0 &&
+      ballX + BALL_SIZE >= PADDLE_X_RIGHT &&
+      ballX <= PADDLE_X_RIGHT + PADDLE_W &&
+      ballY + BALL_SIZE >= aiY &&
+      ballY <= aiY + PADDLE_H) {
+    onPaddleHit(false);
+  }
+
+  // Scoring
+  if (ballX < -BALL_SIZE) onScore(false); // AI scores
+  if (ballX > W + BALL_SIZE) onScore(true); // Player scores
+}
+
+// ---------------- Rendering ----------------
+function render() {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+
+  // Dashed center line
+  ctx.strokeStyle = "#444";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 12]);
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 0);
+  ctx.lineTo(W / 2, H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Scores (classic Pong style — large, top)
+  ctx.font = "bold 34px 'Courier New', monospace";
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "center";
+  ctx.fillText(String(scoreLeft), W / 2 - 40, 38);
+  ctx.fillText(String(scoreRight), W / 2 + 40, 38);
+
+  // Paddles
+  ctx.fillRect(PADDLE_X_LEFT, playerY, PADDLE_W, PADDLE_H);
+  ctx.fillRect(PADDLE_X_RIGHT, aiY, PADDLE_W, PADDLE_H);
+
+  // Ball
+  if (state === "play" || state === "point") {
+    ctx.fillRect(ballX, ballY, BALL_SIZE, BALL_SIZE);
+  }
+
+  // Overlays
+  ctx.textAlign = "center";
+  if (state === "attract") {
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 32px 'Courier New', monospace";
+    ctx.shadowColor = "#fff";
+    ctx.shadowBlur = 12;
+    ctx.fillText("PONG", W / 2, H / 2 - 20);
+    ctx.shadowBlur = 0;
+    ctx.font = "14px 'Courier New', monospace";
+    ctx.fillStyle = "#888";
+    ctx.fillText("PRESS ANY KEY TO START", W / 2, H / 2 + 30);
+  } else if (state === "ready") {
+    ctx.fillStyle = "#fff";
+    ctx.font = "14px 'Courier New', monospace";
+    ctx.fillText("GET READY", W / 2, H / 2 + 50);
+  } else if (state === "gameover") {
+    ctx.fillStyle = winner === "YOU" ? "#22ff88" : "#ff4444";
+    ctx.font = "bold 24px 'Courier New', monospace";
+    ctx.shadowColor = ctx.fillStyle;
+    ctx.shadowBlur = 10;
+    ctx.fillText(winner === "YOU" ? "YOU WIN!" : "CPU WINS", W / 2, H / 2 - 10);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#fff";
+    ctx.font = "13px 'Courier New', monospace";
+    ctx.fillText("PRESS ANY KEY TO PLAY AGAIN", W / 2, H / 2 + 30);
+  }
+}
+
+// ---------------- CRT glass (WebGL shader layer) ----------------
+// Same approach as Puck Man: game renders to 2D canvas, then we upload
+// it as a texture and draw through a fragment shader (scanlines, barrel
+// distortion / tube curvature, glass sheen).
+let fx = document.getElementById("fx");
+const crtlabel = document.getElementById("crtlabel");
+let fxGL = null;
+
+function initFX() {
+  const gl = fx.getContext("webgl", { alpha: false });
+  if (!gl) return;
+  const VS = [
+    "attribute vec2 a_pos;",
+    "varying vec2 vUv;",
+    "void main() {",
+    "  vUv = vec2(0.5 + a_pos.x * 0.5, 0.5 - a_pos.y * 0.5);",
+    "  gl_Position = vec4(a_pos, 0.0, 1.0);",
+    "}",
+  ].join("\n");
+  const FS = [
+    "precision highp float;",
+    "varying vec2 vUv;",
+    "uniform sampler2D u_tex;",
+    "uniform vec2 u_res;",
+    "uniform float u_time;",
+    "uniform int u_mode; // 0 pass-through, 1 arcade CRT, 2 glass TV",
+    "vec3 glow8(sampler2D t, vec2 p, vec2 px) {",
+    "  vec3 s = vec3(0.0);",
+    "  s += texture2D(t, p + vec2( px.x, 0.0)).rgb;",
+    "  s += texture2D(t, p + vec2(-px.x, 0.0)).rgb;",
+    "  s += texture2D(t, p + vec2(0.0,  px.y)).rgb;",
+    "  s += texture2D(t, p + vec2(0.0, -px.y)).rgb;",
+    "  s += texture2D(t, p + vec2(2.0*px.x, 0.0)).rgb;",
+    "  s += texture2D(t, p + vec2(-2.0*px.x, 0.0)).rgb;",
+    "  s += texture2D(t, p + vec2(0.0, 2.0*px.y)).rgb;",
+    "  s += texture2D(t, p + vec2(0.0, -2.0*px.y)).rgb;",
+    "  return s * 0.125;",
+    "}",
+    "void main() {",
+    "  vec2 uv = vUv;",
+    "  vec2 px = 1.0 / u_res;",
+    "  vec2 c = uv - 0.5;",
+    "  float r2 = dot(c, c);",
+    "  vec3 col;",
+    "  if (u_mode == 2) { // glass TV — barrel distortion + scanlines + vignette",
+    "    vec2 suv = 0.5 + c * (1.0 + 0.18 * r2);",
+    "    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {",
+    "      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;",
+    "    }",
+    "    col.r = texture2D(u_tex, suv + vec2(0.5, 0.4) * px).r + 0.02;",
+    "    col.g = texture2D(u_tex, suv + vec2(0.0, -0.6) * px).g + 0.02;",
+    "    col.b = texture2D(u_tex, suv + vec2(-0.9, 0.0) * px).b + 0.02;",
+    "    col += (glow8(u_tex, suv, px) - col) * 0.30;",
+    "    col = clamp(col * 1.3 + 0.75 * col * col + 1.25 * col * col * col * col * col, vec3(0.0), vec3(10.0));",
+    "    float vig = 0.01 + 16.0 * uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y);",
+    "    col *= 1.3 * sqrt(vig);",
+    "    float scans = clamp(0.35 + 0.18 * sin(u_time * 6.0 - suv.y * u_res.y * 1.5), 0.0, 1.0);",
+    "    col *= pow(scans, 0.9);",
+    "    col *= 1.0 - 0.23 * clamp(mod(suv.x * u_res.x, 3.0) / 2.0, 0.0, 1.0);",
+    "    vec3 fc = max(col, vec3(0.0));",
+    "    col = (fc * (6.2 * fc + 0.5)) / (fc * (6.2 * fc + 1.7) + 0.06);",
+    "    float d = uv.x * 0.65 + uv.y * 0.75;",
+    "    float sheen = exp(-pow((d - 1.08) / 0.16, 2.0)) * 0.05;",
+    "    sheen += exp(-pow(length(uv - vec2(0.16, 0.14)) / 0.30, 2.0)) * 0.035;",
+    "    col += sheen;",
+    "    // --- glass reflections (procedural, ShaderGlass-style) ---",
+    "    // Fresnel: tube glass reflects more at steep angles (screen edges)",
+    "    float fres = clamp(0.10 + 1.8 * r2, 0.0, 1.0);",
+    "    // Slow-drifting diagonal window band",
+    "    float bandPos = uv.x * 0.7 + uv.y * 0.55 - 0.25 - 0.05 * sin(u_time * 0.15);",
+    "    float refBand = exp(-pow(bandPos / 0.20, 2.0));",
+    "    // Brighter thin edge next to the band, like a window frame reflection",
+    "    float refEdge = exp(-pow((bandPos + 0.26) / 0.045, 2.0));",
+    "    // Soft room light in the top-left corner",
+    "    float refLight = exp(-pow(length(uv - vec2(0.16, 0.18)) / 0.34, 2.0));",
+    "    vec3 refl = refBand * vec3(0.10, 0.115, 0.13);",
+    "    refl += refEdge * vec3(0.055, 0.065, 0.075);",
+    "    refl += refLight * vec3(0.09, 0.085, 0.075);",
+    "    col += refl * (0.45 + 0.55 * fres);",
+    "    col *= 1.0 + 0.008 * sin(u_time * 377.0);",
+    "  } else if (u_mode == 1) { // arcade CRT: scanlines + grille + glow",
+    "    col = texture2D(u_tex, uv).rgb;",
+    "    float row = fract(uv.y * u_res.y * 0.5);",
+    "    col *= 0.80 + 0.20 * cos(row * 6.28318);",
+    "    col *= 0.95 + 0.05 * cos(fract(uv.x * u_res.x) * 3.14159);",
+    "    col += (glow8(u_tex, uv, px) - col) * 0.40;",
+    "    col = vec3(pow(max(col.r, 0.0), 0.625), pow(max(col.g, 0.0), 0.625), pow(max(col.b, 0.0), 0.625));",
+    "    col *= 1.0 - 0.30 * smoothstep(0.18, 0.50, r2);",
+    "  } else {",
+    "    col = texture2D(u_tex, uv).rgb;",
+    "  }",
+    "  gl_FragColor = vec4(col, 1.0);",
+    "}",
+  ].join("\n");
+
+  function makeShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s)); return null;
+    }
+    return s;
+  }
+  const vs = makeShader(gl.VERTEX_SHADER, VS);
+  const fs = makeShader(gl.FRAGMENT_SHADER, FS);
+  if (!vs || !fs) return;
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(p)); return;
+  }
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  fxGL = {
+    gl, p, tex,
+    aPos: gl.getAttribLocation(p, "a_pos"),
+    uTex: gl.getUniformLocation(p, "u_tex"),
+    uRes: gl.getUniformLocation(p, "u_res"),
+    uTime: gl.getUniformLocation(p, "u_time"),
+    uMode: gl.getUniformLocation(p, "u_mode"),
+  };
+}
+
+function setupFxEvents() {
+  fx.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    fxGL = null;
+    setCRT(0);
+  });
+  fx.addEventListener("webglcontextrestored", () => {
+    initFX();
+    setCRT(2);
+  });
+}
+
+initFX();
+setupFxEvents();
+
+let crtMode = 2; // 0 off, 1 arcade, 2 glass
+const CRT_NAMES = ["Off", "Arcade", "Glass"];
+function setCRT(m) {
+  crtMode = fxGL ? m : 0;
+  fx.style.display = crtMode === 0 ? "none" : "block";
+  if (crtlabel) crtlabel.textContent = fxGL ? CRT_NAMES[crtMode] : "No WebGL";
+}
+function fxRender(t) {
+  const f = fxGL;
+  if (!f || crtMode === 0 || f.gl.isContextLost()) return;
+  const { gl, p, tex } = f;
+  gl.viewport(0, 0, fx.width, fx.height);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.useProgram(p);
+  gl.enableVertexAttribArray(f.aPos);
+  gl.vertexAttribPointer(f.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform1i(f.uTex, 0);
+  gl.uniform2f(f.uRes, W, H);
+  gl.uniform1f(f.uTime, t);
+  gl.uniform1i(f.uMode, crtMode);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+setCRT(2);
+
+// ---------------- Input ----------------
+window.addEventListener("keydown", (e) => {
+  audio();
+  if (e.code === "ArrowUp" || e.code === "KeyW") { keyUp = true; e.preventDefault(); }
+  if (e.code === "ArrowDown" || e.code === "KeyS") { keyDown = true; e.preventDefault(); }
+  if (e.code === "KeyP") {
+    if (state === "play") state = "paused";
+    else if (state === "paused") state = "play";
+  }
+  if (e.code === "KeyM") muted = !muted;
+  if (e.code === "KeyC") setCRT((crtMode + 1) % 3);
+
+  // Start / restart
+  if (state === "attract") {
+    state = "ready";
+    stateTimer = 1.0;
+    scoreLeft = 0; scoreRight = 0;
+    resetBall();
+  } else if (state === "gameover") {
+    state = "ready";
+    stateTimer = 1.0;
+    scoreLeft = 0; scoreRight = 0;
+    resetBall();
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "ArrowUp" || e.code === "KeyW") keyUp = false;
+  if (e.code === "ArrowDown" || e.code === "KeyS") keyDown = false;
+});
+
+// Touch support (tap to start, drag to move)
+let touchActive = false;
+cv.addEventListener("touchstart", (e) => {
+  e.preventDefault();
+  audio();
+  touchActive = true;
+  if (state === "attract" || state === "gameover") {
+    state = "ready"; stateTimer = 1.0;
+    scoreLeft = 0; scoreRight = 0;
+    resetBall();
+  }
+  updateTouchY(e.touches[0].clientY);
+});
+cv.addEventListener("touchmove", (e) => {
+  e.preventDefault();
+  if (touchActive) updateTouchY(e.touches[0].clientY);
+});
+cv.addEventListener("touchend", () => { touchActive = false; });
+function updateTouchY(clientY) {
+  const rect = cv.getBoundingClientRect();
+  const y = (clientY - rect.top) / rect.height * H;
+  playerY = Math.max(0, Math.min(H - PADDLE_H, y - PADDLE_H / 2));
+}
+
+// ---------------- Main loop ----------------
+function frame(now) {
+  let dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  update(dt);
+  render();
+  fxRender(now / 1000);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
