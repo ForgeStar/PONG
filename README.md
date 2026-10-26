@@ -11,4 +11,4 @@ A single-file Pong clone in vanilla JS + canvas, single player vs AI, rendered i
 
 This repo is deployed as-is from the root, so the game lives at:
 
-    https://forgestar.github.io/PongArcade/
+    https://forgestar.github.io/PONG/
